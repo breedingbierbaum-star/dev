@@ -37,3 +37,17 @@ python -m pip install -r requirements.txt
 ```
 
 不要提交虚拟环境、密钥或 `.env` 文件；如需记录环境变量格式，可创建不含真实密钥的 `.env.example`。
+
+## RDMA 网卡 MAC 地址一致性检测
+
+在具有 cloud-init 网络元数据的 Linux 目标主机上运行：
+
+```bash
+python3 scripts/rdma_mac_check.py
+```
+
+脚本读取 `/run/cloud-init/instance-data.json` 和 `/sys/class/net/`，自动检查
+`eth1`、`eth2` 等网卡与 `network_1`、`network_2` 等元数据的 MAC 是否一致，
+排除管理网卡 `eth0`，并显示 `RdmaDataType`。需有读取这些文件的权限。
+全部匹配时退出码为 `0`；无目标网卡、缺少对应网络或 MAC、MAC 不一致时退出码为 `1`。
+该脚本校验 MAC 一致性，不验证 RDMA 通信功能。
