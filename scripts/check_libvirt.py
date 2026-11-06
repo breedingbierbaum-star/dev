@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 
 
 def colorize(text, code, stream=None):
@@ -23,6 +24,28 @@ def colorize(text, code, stream=None):
 def status_text(status):
     return colorize(status, {'通过': '32', '已修复': '36', '失败': '31',
                              '待处理': '33', '跳过': '90'}.get(status, '0'))
+
+
+def display_width(text):
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+               for char in text)
+
+
+def pad(text, width):
+    return text + ' ' * max(0, width - display_width(text))
+
+
+def brief(text, width=44):
+    text = ' '.join(text.split())
+    if display_width(text) <= width:
+        return text
+    result = ''
+    for char in text:
+        if display_width(result + char) > width - 3:
+            break
+        result += char
+    return result + '...'
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -44,7 +67,9 @@ class Checker:
 
     def report(self, name, status, detail, advice=''):
         self.results.append((name, status, detail, advice))
-        print(f'[{len(self.results)}/5] {name:<12} {status_text(status)}  {detail}', flush=True)
+        summary = '检查未通过，详见下方' if status == '失败' else brief(detail)
+        label = status_text(status) + ' ' * max(0, 6 - display_width(status))
+        print(f'  {len(self.results)}  {pad(name, 16)}  {label}  {summary}', flush=True)
 
     def command(self, command, timeout=None):
         if self.args.verbose:
@@ -167,7 +192,10 @@ class Checker:
         return '已修复', f'{len(down)} 个 down 端口已删除并验证'
 
     def execute(self):
-        print('libvirt 主机检查\n模式：' + ('只读检查' if self.args.check_only else '检查并自动修复'), flush=True)
+        print('\n' + colorize('LIBVIRT 主机检查', '1'))
+        print('模式：' + ('只读检查' if self.args.check_only else '检查并自动修复'))
+        print('\n  #  ' + pad('检查项', 16) + '  ' + pad('状态', 6) + '  说明')
+        print('  ' + '-' * 70, flush=True)
         virsh_error = None
         try:
             self.virsh()
@@ -226,11 +254,21 @@ class Checker:
                 self.report('端口处理', '失败', str(exc), '检查端口管理接口、服务日志及对应端口状态')
         counts = Counter(status for _, status, _, _ in self.results)
         code = int(any(status not in ('通过', '已修复') for _, status, _, _ in self.results))
-        print('\n检查汇总：' + '｜'.join(f'{status_text(key)} {counts[key]} 项' for key in ('通过', '已修复', '失败', '待处理', '跳过')))
-        for name, status, detail, advice in self.results:
-            if status not in ('通过', '已修复'):
-                print(f'- {name} [{status_text(status)}]：{detail}\n  建议：{advice}')
-        print(f'总耗时：{time.monotonic() - self.started:.1f} 秒｜退出码：{code}', flush=True)
+        print('  ' + '-' * 70)
+        print('\n结果：' + colorize('全部通过' if code == 0 else '需要处理', '32' if code == 0 else '33'))
+        print('  ' + ' / '.join(f'{key} {counts[key]}' for key in
+                               ('通过', '已修复', '失败', '待处理', '跳过') if counts[key]))
+        issues = [(name, status, detail, advice) for name, status, detail, advice in self.results
+                  if status in ('失败', '待处理')]
+        if issues:
+            print('\n' + colorize('处理详情', '1'))
+        for name, status, detail, advice in issues:
+            print(f'\n  {name} · {status_text(status)}')
+            for line in detail.splitlines():
+                print(f'    {line}')
+            if advice:
+                print(f'    建议：{advice}')
+        print(f'\n耗时 {time.monotonic() - self.started:.1f} 秒 · 退出码 {code}\n', flush=True)
         return code
 
 
