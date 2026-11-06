@@ -13,6 +13,25 @@ import urllib.parse
 import urllib.request
 
 
+def colorize(text, code, stream=None):
+    stream = sys.stdout if stream is None else stream
+    if stream.isatty() and os.environ.get('TERM') != 'dumb' and 'NO_COLOR' not in os.environ:
+        return f'\033[{code}m{text}\033[0m'
+    return text
+
+
+def status_text(status):
+    return colorize(status, {'通过': '32', '已修复': '36', '失败': '31',
+                             '待处理': '33', '跳过': '90'}.get(status, '0'))
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        if message:
+            stream = sys.stderr if file is None else file
+            super()._print_message(colorize(message, '36', stream), stream)
+
+
 class CheckError(Exception):
     pass
 
@@ -25,7 +44,7 @@ class Checker:
 
     def report(self, name, status, detail, advice=''):
         self.results.append((name, status, detail, advice))
-        print(f'[{len(self.results)}/5] {name:<12} {status}  {detail}', flush=True)
+        print(f'[{len(self.results)}/5] {name:<12} {status_text(status)}  {detail}', flush=True)
 
     def command(self, command, timeout=None):
         if self.args.verbose:
@@ -207,10 +226,10 @@ class Checker:
                 self.report('端口处理', '失败', str(exc), '检查端口管理接口、服务日志及对应端口状态')
         counts = Counter(status for _, status, _, _ in self.results)
         code = int(any(status not in ('通过', '已修复') for _, status, _, _ in self.results))
-        print('\n检查汇总：' + '｜'.join(f'{key} {counts[key]} 项' for key in ('通过', '已修复', '失败', '待处理', '跳过')))
+        print('\n检查汇总：' + '｜'.join(f'{status_text(key)} {counts[key]} 项' for key in ('通过', '已修复', '失败', '待处理', '跳过')))
         for name, status, detail, advice in self.results:
             if status not in ('通过', '已修复'):
-                print(f'- {name} [{status}]：{detail}\n  建议：{advice}')
+                print(f'- {name} [{status_text(status)}]：{detail}\n  建议：{advice}')
         print(f'总耗时：{time.monotonic() - self.started:.1f} 秒｜退出码：{code}', flush=True)
         return code
 
@@ -223,7 +242,17 @@ def positive(value):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''使用示例：
+  python3 scripts/check_libvirt.py --check-only       # 只读检查
+  sudo python3 scripts/check_libvirt.py               # 检查并自动修复
+  python3 scripts/check_libvirt.py --check-only --verbose
+  python3 scripts/check_libvirt.py --check-only > check_libvirt.log 2>&1
+
+默认模式会重启异常服务并删除 down 端口，请确认维护条件后运行。
+颜色仅在交互终端启用；重定向或通过管道保存日志时输出纯文本。
+设置 NO_COLOR 环境变量可禁用颜色。''')
     parser.add_argument('--check-only', action='store_true', help='只检查，不重启服务或删除端口')
     parser.add_argument('--verbose', action='store_true', help='显示完整命令及输出')
     parser.add_argument('--service', default='libvirtd', help='systemd 服务名（默认 libvirtd）')
