@@ -51,3 +51,54 @@ python3 scripts/rdma_mac_check.py
 排除管理网卡 `eth0`，并显示 `RdmaDataType`。需有读取这些文件的权限。
 全部匹配时退出码为 `0`；无目标网卡、缺少对应网络或 MAC、MAC 不一致时退出码为 `1`。
 该脚本校验 MAC 一致性，不验证 RDMA 通信功能。
+
+## libvirt、IPMI 和端口检查
+
+脚本：[scripts/check_libvirt.py](scripts/check_libvirt.py)。仅使用 Python 标准库，无需安装 `libvirt-python`。
+
+### 运行条件
+
+在目标 Linux 主机运行，依赖 systemd、`virsh`、`/usr/bin/bes-power`、`ipmitool`，
+并要求本机 `http://127.0.0.1:2929` 提供端口管理接口。
+需要访问 `qemu:///system` 和本地 IPMI 设备；自动重启 libvirtd 需要 root 权限。
+本脚本针对使用 `libvirtd` 服务的主机，不适用于仅运行模块化守护进程的部署。
+
+### 使用方式
+
+```bash
+# 交互输入密码，避免将密码明文写入命令历史；使用 Bash 执行。
+read -r -s -p 'IPMI password: ' IPMI_PASSWORD
+printf '\n'
+export IPMI_PASSWORD
+sudo --preserve-env=IPMI_PASSWORD python3 scripts/check_libvirt.py
+unset IPMI_PASSWORD
+```
+
+IPMI 用户固定为 `operator`，使用 `ipmitool -I open -U operator -E mc info`。
+脚本继承环境变量 `IPMI_PASSWORD`，仓库不保存密码；本地 open 接口是否使用密码由驱动决定。
+`sudo --preserve-env` 需要符合主机的 sudo 策略。
+
+### 执行流程与影响
+
+1. 执行 `virsh -c qemu:///system list`，检查 `/usr/bin/bes-power status` 是否成功且输出 `on` 或 `off`。
+2. 展示 libvirtd 状态，并查询 `LoadState`、`ActiveState` 和 `SubState`。
+   服务已加载但不是 `active (running)` 时，自动尝试重启并复查服务和 virsh。
+   状态查询失败、信息不完整或服务未加载时返回失败，不尝试重启。
+   服务已正常运行但 virsh 失败时，仅报告异常。
+3. 检查 IPMI 管理控制器信息；即使服务检查失败，也会执行这一步。
+4. 仅当服务和 IPMI 检查均通过时，调用 `GET /v1/ports`，
+   对 `status` 严格等于 `down` 的端口逐个调用 `DELETE /v1/vports/{id}`，
+   再次查询并确认原端口 ID 已消失。删除失败会继续处理其他端口，最终返回失败。
+
+**此脚本包含自动修复操作，没有只读或预演模式。运行可能重启 libvirtd，
+并删除 down 状态的 vport；请在允许这些操作的目标主机上执行。**
+端口 API 预期返回 `{"ports": [{"id": "port-id", "status": "down"}]}`；
+空列表视为无待处理端口。请求默认超时 30 秒，重启命令超时 90 秒。
+脚本不接受命令行参数，也没有 `--help` 模式。
+
+### 结果判断
+
+- 退出码 `0`：服务、IPMI 检查以及必要的端口处理全部成功。
+- 退出码 `1`：检测到异常、重启失败、权限不足或端口查询、删除、复查失败。
+
+输出包含执行命令和检查结果，排障时可先查看失败步骤。
