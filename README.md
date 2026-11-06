@@ -102,3 +102,65 @@ IPMI 用户固定为 `operator`，使用 `ipmitool -I open -U operator -E mc inf
 - 退出码 `1`：检测到异常、重启失败、权限不足或端口查询、删除、复查失败。
 
 输出包含执行命令和检查结果，排障时可先查看失败步骤。
+
+## ISC DHCP IPv4 租约清理
+
+脚本：[scripts/clean_dhcp_leases.py](scripts/clean_dhcp_leases.py)。按 IP 列表删除
+ISC DHCP 租约文件中的全部匹配记录，包括同一 IP 的多条历史记录。
+仅使用 Python 标准库；预览需要读取文件，实际执行需要 Linux、systemd 和 root 权限。
+
+### 准备 IP 列表与预览
+
+创建 `ips.txt`，每行一个 IPv4 地址，支持空行、重复地址和 `#` 注释：
+
+```text
+# 需要清理的地址
+192.0.2.10
+192.0.2.11 # 第二个地址
+```
+
+在项目根目录运行，默认只显示每个 IP 匹配的记录数，不修改文件或操作服务：
+
+```bash
+python3 scripts/clean_dhcp_leases.py ips.txt
+python3 scripts/clean_dhcp_leases.py --help
+```
+
+默认租约文件为 `/var/lib/dhcp/dhcpd.leases`，默认服务为 `isc-dhcp-server`。
+可通过 `--leases` 和 `--service` 指定实际路径与服务名：
+
+```bash
+python3 scripts/clean_dhcp_leases.py ips.txt --leases /var/lib/dhcpd/dhcpd.leases --service dhcpd
+```
+
+### 实际清理
+
+确认预览和目标主机后，添加 `--apply`：
+
+```bash
+sudo python3 scripts/clean_dhcp_leases.py ips.txt --apply
+# 自定义路径和服务时，预览与执行应使用相同参数
+sudo python3 scripts/clean_dhcp_leases.py ips.txt --leases /var/lib/dhcpd/dhcpd.leases --service dhcpd --apply
+```
+
+执行时先确认服务为 active，再停止服务并确认 inactive，重新读取租约文件。
+存在匹配记录时，在同目录创建 `dhcpd.leases.bak.<时间戳>` 形式的备份，
+通过同目录临时文件和原子替换写入清理结果，保留文件权限位、属主和属组，
+随后检查目标 IP 记录是否消失。脚本识别租约内的嵌套块，遇到目标租约块不完整时拒绝修改。
+IP 列表无效、为空，或租约文件不存在、不是普通文件、是符号链接时会报错。
+
+**实际清理会短暂停止 DHCP 服务，影响期间的地址分配和续租。
+即使没有匹配记录，`--apply` 也会停止并重新启动服务，但不会写文件或创建备份。**
+进入停止步骤后，即使清理报错，脚本也会尝试启动服务并确认 active；
+恢复失败时需立即人工检查。脚本没有自动回滚文件的功能，
+需要恢复时应先停止对应服务，再使用输出的备份路径恢复文件并启动、检查服务。
+替换文件不保证保留 ACL、扩展属性或 SELinux 标签，使用这些机制的主机需另行核对。
+
+清理服务端记录不会主动释放客户端持有的地址，也不会删除 DHCP 配置中的静态保留项；
+客户端继续使用原地址时仍需协调，避免地址冲突。
+此脚本针对 ISC DHCP IPv4 文本租约文件，不适用于 Kea、dnsmasq 或 IPv6 租约。
+
+### 结果判断
+
+正常预览或清理完成返回 `0`；文件、权限、租约解析或服务操作失败返回 `1`；
+命令行参数错误由 argparse 返回 `2`。请结合输出的匹配数量、备份路径和服务恢复状态判断结果。
