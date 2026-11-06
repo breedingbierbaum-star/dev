@@ -54,19 +54,28 @@ python3 scripts/rdma_mac_check.py
 
 ## libvirt、IPMI 和端口检查
 
-脚本：[scripts/check_libvirt.py](scripts/check_libvirt.py)。仅使用 Python 标准库，无需安装 `libvirt-python`。
+脚本：[scripts/check_libvirt.py](scripts/check_libvirt.py)。仅使用 Python 标准库，
+无需安装 libvirt-python。适用于使用 libvirtd 的 Linux/systemd 主机，
+依赖 virsh、/usr/bin/bes-power、ipmitool 及本机端口管理接口。
 
-### 运行条件
-
-在目标 Linux 主机运行，依赖 systemd、`virsh`、`/usr/bin/bes-power`、`ipmitool`，
-并要求本机 `http://127.0.0.1:2929` 提供端口管理接口。
-需要访问 `qemu:///system` 和本地 IPMI 设备；自动重启 libvirtd 需要 root 权限。
-本脚本针对使用 `libvirtd` 服务的主机，不适用于仅运行模块化守护进程的部署。
-
-### 使用方式
+### 运行方式
 
 ```bash
-# 交互输入密码，避免将密码明文写入命令历史；使用 Bash 执行。
+# 只读检查：不重启服务、不删除端口
+python3 scripts/check_libvirt.py --check-only
+# 保持原有行为：允许自动重启异常服务、删除 down 端口
+sudo --preserve-env=IPMI_PASSWORD python3 scripts/check_libvirt.py
+# 显示完整执行命令与输出
+python3 scripts/check_libvirt.py --check-only --verbose
+python3 scripts/check_libvirt.py --help
+```
+
+需要访问 qemu:///system 和本地 IPMI 设备，重启服务需要 root 权限。
+IPMI 固定使用 `ipmitool -I open -U operator -E mc info`，
+继承 IPMI_PASSWORD 环境变量；仓库不保存密码。
+如需输入密码，可使用 Bash：
+
+```bash
 read -r -s -p 'IPMI password: ' IPMI_PASSWORD
 printf '\n'
 export IPMI_PASSWORD
@@ -74,34 +83,50 @@ sudo --preserve-env=IPMI_PASSWORD python3 scripts/check_libvirt.py
 unset IPMI_PASSWORD
 ```
 
-IPMI 用户固定为 `operator`，使用 `ipmitool -I open -U operator -E mc info`。
-脚本继承环境变量 `IPMI_PASSWORD`，仓库不保存密码；本地 open 接口是否使用密码由驱动决定。
-`sudo --preserve-env` 需要符合主机的 sudo 策略。
+sudo 保留环境变量需符合主机策略；本地 open 接口是否使用密码取决于驱动。
 
-### 执行流程与影响
+### 行为与输出
 
-1. 执行 `virsh -c qemu:///system list`，检查 `/usr/bin/bes-power status` 是否成功且输出 `on` 或 `off`。
-2. 展示 libvirtd 状态，并查询 `LoadState`、`ActiveState` 和 `SubState`。
-   服务已加载但不是 `active (running)` 时，自动尝试重启并复查服务和 virsh。
-   状态查询失败、信息不完整或服务未加载时返回失败，不尝试重启。
-   服务已正常运行但 virsh 失败时，仅报告异常。
-3. 检查 IPMI 管理控制器信息；即使服务检查失败，也会执行这一步。
-4. 仅当服务和 IPMI 检查均通过时，调用 `GET /v1/ports`，
-   对 `status` 严格等于 `down` 的端口逐个调用 `DELETE /v1/vports/{id}`，
-   再次查询并确认原端口 ID 已消失。删除失败会继续处理其他端口，最终返回失败。
+检查 virsh 连接、bes-power 电源状态、libvirtd、IPMI 和端口。
+bes-power 返回 on 或 off 均表示查询成功，输出会明确标注当前电源状态。
+服务未加载或状态信息不完整时不重启；已加载但不是 active/running 时，
+默认尝试重启，再有限次数复查服务和 virsh。
+已正常运行但 virsh 失败时报告异常，不自动重启。
 
-**此脚本包含自动修复操作，没有只读或预演模式。运行可能重启 libvirtd，
-并删除 down 状态的 vport；请在允许这些操作的目标主机上执行。**
-端口 API 预期返回 `{"ports": [{"id": "port-id", "status": "down"}]}`；
-空列表视为无待处理端口。请求默认超时 30 秒，重启命令超时 90 秒。
-脚本不接受命令行参数，也没有 `--help` 模式。
+前四项未全部通过或修复时，端口处理显示“跳过”及原因。
+端口接口为 `GET /v1/ports`，预期返回
+`{"ports":[{"id":"port-id","status":"down"}]}`，允许空数组。
+全部记录均校验 ID 与状态，支持 up/down；缺失、未知状态或重复 ID 会报错，
+不会将其当作正常端口。实际接口如支持其他状态，需要先扩展校验规则。
 
-### 结果判断
+只读模式发现 down 端口时显示“待处理”，不删除。
+默认模式对 down 端口调用 `DELETE /v1/vports/{id}`，
+继续处理其余端口并重试查询，确认原 ID 已消失。
+单个删除请求失败仍会报告失败，即使复查时端口已消失。
 
-- 退出码 `0`：服务、IPMI 检查以及必要的端口处理全部成功。
-- 退出码 `1`：检测到异常、重启失败、权限不足或端口查询、删除、复查失败。
+**直接运行仍包含自动修复操作，可能重启服务、删除 down vport；
+需要纯检查时请显式传入 --check-only。修复操作不会自动回滚。**
 
-输出包含执行命令和检查结果，排障时可先查看失败步骤。
+默认精简输出，使用“通过、已修复、失败、待处理、跳过”标注结果，
+最终汇总各类数量、异常原因、建议操作、总耗时和退出码。
+重试时显示等待进度；完整命令及输出由 --verbose 开启，失败时始终显示错误原因。
+virsh 的最终结果在服务复查后输出，开始后的检查阶段可能需要等待命令超时。
+
+### 可选参数与退出码
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| --check-only | 关闭 | 禁止服务重启与端口删除 |
+| --verbose | 关闭 | 显示命令及完整输出 |
+| --service | libvirtd | systemd 服务名；不改变 virsh 连接地址 |
+| --api-url | http://127.0.0.1:2929 | 端口管理接口基础地址 |
+| --timeout | 30 | 单次命令或 HTTP 请求超时秒数；重启命令固定 90 秒 |
+| --attempts | 5 | 每项修复后验证的最大尝试次数，范围 1–10 |
+| --interval | 2 | 验证重试间隔秒数 |
+
+验证总时长包含每次操作的超时，并非固定总超时；单次 DELETE 不自动重试。
+退出码 0 表示全部通过或已修复；1 表示有失败、待处理或跳过项；
+2 表示参数错误；130 表示用户中断。
 
 ## ISC DHCP IPv4 租约清理
 

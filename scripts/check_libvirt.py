@@ -1,158 +1,251 @@
 #!/usr/bin/env python3
-"""检查 virsh、bes-power 和 libvirtd，必要时重启 libvirtd。"""
-import os
+"""检查 virsh、电源、libvirtd、IPMI 和端口；默认自动修复，可选只读模式。"""
+import argparse
+from collections import Counter
 import json
-import urllib.request
-import urllib.parse
-import urllib.error
+import os
+import shlex
 import subprocess
 import sys
-
-TIMEOUT = 30
-
-
-def run(command, timeout=TIMEOUT, env=None):
-    print('\n$ ' + ' '.join(command), flush=True)
-    try:
-        result = subprocess.run(command, capture_output=True, text=True,
-                                errors='replace', timeout=timeout, check=False, env=env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print('执行失败: {}'.format(exc), flush=True)
-        return None
-    if result.stdout.strip():
-        print(result.stdout.strip(), flush=True)
-    if result.stderr.strip():
-        print(result.stderr.strip(), file=sys.stderr, flush=True)
-    return result
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
-def virsh_check():
-    result = run(['virsh', '-c', 'qemu:///system', 'list'])
-    ok = result is not None and result.returncode == 0
-    print('virsh list: {}'.format('正常' if ok else '异常'))
-    return ok
+class CheckError(Exception):
+    pass
 
 
-def check_services():
-    initial_virsh = virsh_check()
-    power = run(['/usr/bin/bes-power', 'status'])
-    power_value = power.stdout.strip().lower() if power is not None else ''
-    power_ok = power is not None and power.returncode == 0 and power_value in ('on', 'off')
-    print('bes-power status: {}'.format('正常 ({})'.format(power_value) if power_ok else '异常，预期输出 on 或 off'))
+class Checker:
+    def __init__(self, args):
+        self.args = args
+        self.results = []
+        self.started = time.monotonic()
 
-    # status 供人工查看；is-active 的精确输出用于判断是否运行。
-    run(['systemctl', '--no-pager', '--full', 'status', 'libvirtd'])
-    state_result = run(['systemctl', 'show', 'libvirtd', '--property=LoadState',
-                        '--property=ActiveState', '--property=SubState'])
-    if state_result is None or state_result.returncode != 0:
-        print('无法检查 libvirtd 状态，未尝试重启。')
-        return 1
-    states = dict(line.split('=', 1) for line in state_result.stdout.splitlines() if '=' in line)
-    if not all(key in states for key in ('LoadState', 'ActiveState', 'SubState')):
-        print('libvirtd 状态信息不完整，未尝试重启。')
-        return 1
-    if states['LoadState'] != 'loaded':
-        print('libvirtd 服务未正常加载（{}），无法确认服务，未尝试重启。'.format(states['LoadState']))
-        return 1
-    if states['ActiveState'] == 'active' and states['SubState'] == 'running':
-        print('libvirtd: active (running)')
-        final_virsh = initial_virsh
-    else:
-        print('libvirtd 不是 active (running)，尝试重启。')
-        if os.geteuid() != 0:
-            print('重启需要 root 权限，请使用 sudo 运行脚本。')
-            return 1
-        restart = run(['systemctl', 'restart', 'libvirtd'], timeout=90)
-        run(['systemctl', '--no-pager', '--full', 'status', 'libvirtd'])
-        after = run(['systemctl', 'show', 'libvirtd', '--property=LoadState',
-                     '--property=ActiveState', '--property=SubState'])
-        after_states = dict(line.split('=', 1) for line in after.stdout.splitlines() if '=' in line) if after else {}
-        final_virsh = virsh_check()
-        if (restart is None or restart.returncode != 0 or after is None or after.returncode != 0
-                or after_states.get('LoadState') != 'loaded'
-                or after_states.get('ActiveState') != 'active'
-                or after_states.get('SubState') != 'running'):
-            print('libvirtd 重启或状态复查失败。')
-            return 1
-    if not final_virsh or not power_ok:
-        print('\n检查结果：存在异常，请查看上面的输出。')
-        return 1
-    print('\nvirsh、bes-power 和 libvirtd 检查正常。')
-    return 0
+    def report(self, name, status, detail, advice=''):
+        self.results.append((name, status, detail, advice))
+        print(f'[{len(self.results)}/5] {name:<12} {status}  {detail}', flush=True)
 
-
-def check_ports():
-    base = 'http://127.0.0.1:2929'
-    print('\n检查端口状态：GET /v1/ports', flush=True)
-    try:
-        with urllib.request.urlopen(base + '/v1/ports', timeout=TIMEOUT) as response:
-            data = json.load(response)
-        ports = data.get('ports') if isinstance(data, dict) else None
-        if not isinstance(ports, list) or any(not isinstance(port, dict) for port in ports):
-            raise ValueError('返回数据不包含有效的 ports 数组')
-        down = [port for port in ports if port.get('status') == 'down']
-        if any(not isinstance(port.get('id'), (str, int)) or isinstance(port.get('id'), bool)
-               or str(port.get('id')).strip() in ('', '.', '..') for port in down):
-            raise ValueError('存在没有有效 id 的 down 端口，未执行删除')
-    except (OSError, ValueError, UnicodeError) as exc:
-        print('端口查询失败: {}'.format(exc))
-        return False
-    if not down:
-        print('没有状态为 down 的端口。')
-        return True
-    print('发现 {} 个 down 端口。'.format(len(down)))
-    success = True
-    for port in down:
-        port_id = str(port['id'])
-        path_id = urllib.parse.quote(port_id, safe='')
-        print('删除 vport: {}'.format(port_id), flush=True)
-        request = urllib.request.Request(base + '/v1/vports/' + path_id, method='DELETE')
+    def command(self, command, timeout=None):
+        if self.args.verbose:
+            print('$ ' + shlex.join(command), flush=True)
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                print('删除请求成功，HTTP {}'.format(response.status))
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    errors='replace', timeout=timeout or self.args.timeout,
+                                    check=False)
+        except FileNotFoundError as exc:
+            raise CheckError(f'命令不存在：{command[0]}') from exc
+        except PermissionError as exc:
+            raise CheckError(f'无权执行：{command[0]}') from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CheckError(f'{command[0]} 执行超时（{timeout or self.args.timeout:g} 秒）') from exc
+        except OSError as exc:
+            raise CheckError(f'{command[0]} 执行失败：{exc}') from exc
+        if self.args.verbose:
+            for output in (result.stdout, result.stderr):
+                if output.strip():
+                    print(output.strip(), flush=True)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip() or '无错误输出'
+            raise CheckError(f'{command[0]} 退出码 {result.returncode}：{detail}')
+        return result.stdout.strip()
+
+    def state(self):
+        output = self.command(['systemctl', 'show', self.args.service,
+                               '--property=LoadState', '--property=ActiveState', '--property=SubState'])
+        states = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        if not all(states.get(k) for k in ('LoadState', 'ActiveState', 'SubState')):
+            raise CheckError('服务状态信息不完整')
+        if states['LoadState'] != 'loaded':
+            raise CheckError(f"服务未正常加载：{states['LoadState']}")
+        return states['ActiveState'] == 'active' and states['SubState'] == 'running', states
+
+    def wait_for(self, action, label):
+        # 有限次数重试；每次操作也受 --timeout 限制。
+        error = None
+        for attempt in range(self.args.attempts):
+            try:
+                return action()
+            except CheckError as exc:
+                error = exc
+                if attempt + 1 < self.args.attempts:
+                    print(f'  等待{label}：{attempt + 1}/{self.args.attempts} 次未通过，'
+                          f'{self.args.interval:g} 秒后复查', flush=True)
+                    time.sleep(self.args.interval)
+        raise CheckError(f'{label}验证失败：{error}')
+
+    def virsh(self):
+        self.command(['virsh', '-c', 'qemu:///system', 'list'])
+
+    def service_ready(self):
+        ready, states = self.state()
+        if not ready:
+            raise CheckError(f"{states['ActiveState']}/{states['SubState']}")
+
+    def ports(self):
+        try:
+            with urllib.request.urlopen(self.args.api_url.rstrip('/') + '/v1/ports',
+                                        timeout=self.args.timeout) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise CheckError(f'端口查询 HTTP {exc.code}：{exc.reason}') from exc
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise CheckError(f'端口查询失败：{exc}') from exc
+        ports = data.get('ports') if isinstance(data, dict) else None
+        if not isinstance(ports, list):
+            raise CheckError('接口返回缺少有效 ports 数组')
+        seen = set()
+        for port in ports:
+            if not isinstance(port, dict):
+                raise CheckError('端口记录不是对象')
+            ident = port.get('id')
+            if (isinstance(ident, bool) or not isinstance(ident, (str, int))
+                    or str(ident).strip() in ('', '.', '..')):
+                raise CheckError('端口 ID 无效，未执行删除')
+            if str(ident) in seen:
+                raise CheckError(f'端口 ID 重复：{ident}')
+            seen.add(str(ident))
+            if port.get('status') not in ('up', 'down'):
+                raise CheckError(f'端口 {ident} 状态未知：{port.get("status")!r}；未执行删除')
+        return ports
+
+    def delete_port(self, ident):
+        url = self.args.api_url.rstrip('/') + '/v1/vports/' + urllib.parse.quote(ident, safe='')
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method='DELETE'),
+                                        timeout=self.args.timeout) as response:
+                print(f'  端口 {ident}：删除请求 HTTP {response.status}', flush=True)
+        except urllib.error.HTTPError as exc:
+            raise CheckError(f'端口 {ident} 删除 HTTP {exc.code}：{exc.reason}') from exc
         except (OSError, ValueError) as exc:
-            print('删除失败: {}'.format(exc))
-            success = False
-    print('\n重新查询端口，验证删除结果。')
+            raise CheckError(f'端口 {ident} 删除失败：{exc}') from exc
+
+    def check_ports(self):
+        ports = self.ports()
+        down = [str(p['id']) for p in ports if p['status'] == 'down']
+        if not down:
+            return '通过', f'共 {len(ports)} 个端口，无 down 端口'
+        if self.args.check_only:
+            return '待处理', f'{len(down)} 个 down 端口：{", ".join(down)}；只读模式未删除'
+        errors = []
+        for ident in down:
+            try:
+                self.delete_port(ident)
+            except CheckError as exc:
+                errors.append(str(exc))
+                print(f'  {exc}', flush=True)
+        def verify():
+            remaining = {str(p['id']) for p in self.ports()} & set(down)
+            if remaining:
+                raise CheckError('原端口仍存在：' + ', '.join(sorted(remaining)))
+        try:
+            self.wait_for(verify, '端口删除结果')
+        except CheckError as exc:
+            errors.append(str(exc))
+        if errors:
+            raise CheckError('；'.join(errors))
+        return '已修复', f'{len(down)} 个 down 端口已删除并验证'
+
+    def execute(self):
+        print('libvirt 主机检查\n模式：' + ('只读检查' if self.args.check_only else '检查并自动修复'), flush=True)
+        virsh_error = None
+        try:
+            self.virsh()
+        except CheckError as exc:
+            virsh_error = str(exc)
+        try:
+            value = self.command(['/usr/bin/bes-power', 'status']).lower()
+            if value not in ('on', 'off'):
+                raise CheckError(f'预期 on 或 off，实际 {value!r}')
+            power = ('通过', f'查询正常，当前电源状态 {value}', '')
+        except CheckError as exc:
+            power = ('失败', str(exc), '检查 bes-power 安装、权限与设备状态')
+        service = ('通过', 'active/running', '')
+        restarted = False
+        try:
+            ready, states = self.state()
+            if not ready:
+                detail = f"{states['ActiveState']}/{states['SubState']}"
+                if self.args.check_only:
+                    service = ('待处理', detail + '；只读模式未重启', '确认维护条件后使用自动修复模式')
+                else:
+                    if os.geteuid() != 0:
+                        raise CheckError('重启需要 root 权限，请使用 sudo 运行')
+                    print(f'  {self.args.service} 当前 {detail}，正在重启', flush=True)
+                    self.command(['systemctl', 'restart', self.args.service], timeout=90)
+                    self.wait_for(self.service_ready, '服务启动')
+                    restarted = True
+                    service = ('已修复', detail + ' → 重启 → active/running', '')
+            if restarted:
+                try:
+                    self.wait_for(self.virsh, 'virsh 连接')
+                    virsh_error = None
+                except CheckError as exc:
+                    virsh_error = str(exc)
+                    raise
+        except CheckError as exc:
+            service = ('失败', str(exc), f'检查 systemctl status {self.args.service} 和 journalctl -u {self.args.service}')
+        self.report('virsh 连接', '失败' if virsh_error else ('已修复' if restarted else '通过'),
+                    virsh_error or 'qemu:///system 连接正常',
+                    '检查 libvirt 日志、连接权限及服务状态' if virsh_error else '')
+        self.report('bes-power', *power)
+        self.report(self.args.service, *service)
+        try:
+            self.command(['ipmitool', '-I', 'open', '-U', 'operator', '-E', 'mc', 'info'])
+            self.report('IPMI', '通过', '管理控制器查询成功')
+        except CheckError as exc:
+            self.report('IPMI', '失败', str(exc), '检查 ipmitool、本地 IPMI 设备权限及驱动')
+        if any(status not in ('通过', '已修复') for _, status, _, _ in self.results):
+            self.report('端口处理', '跳过', '前置检查未全部通过', '先处理上述失败或待处理项，再运行检查')
+        else:
+            try:
+                status, detail = self.check_ports()
+                self.report('端口处理', status, detail,
+                            '确认端口可删除后使用自动修复模式' if status == '待处理' else '')
+            except CheckError as exc:
+                self.report('端口处理', '失败', str(exc), '检查端口管理接口、服务日志及对应端口状态')
+        counts = Counter(status for _, status, _, _ in self.results)
+        code = int(any(status not in ('通过', '已修复') for _, status, _, _ in self.results))
+        print('\n检查汇总：' + '｜'.join(f'{key} {counts[key]} 项' for key in ('通过', '已修复', '失败', '待处理', '跳过')))
+        for name, status, detail, advice in self.results:
+            if status not in ('通过', '已修复'):
+                print(f'- {name} [{status}]：{detail}\n  建议：{advice}')
+        print(f'总耗时：{time.monotonic() - self.started:.1f} 秒｜退出码：{code}', flush=True)
+        return code
+
+
+def positive(value):
+    number = float(value)
+    if not 0 < number < float('inf'):
+        raise argparse.ArgumentTypeError('必须是有限正数')
+    return number
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check-only', action='store_true', help='只检查，不重启服务或删除端口')
+    parser.add_argument('--verbose', action='store_true', help='显示完整命令及输出')
+    parser.add_argument('--service', default='libvirtd', help='systemd 服务名（默认 libvirtd）')
+    parser.add_argument('--api-url', default='http://127.0.0.1:2929', help='端口管理接口基础地址')
+    parser.add_argument('--timeout', type=positive, default=30, help='单次命令/HTTP 请求超时秒数（默认 30）')
+    parser.add_argument('--attempts', type=int, choices=range(1, 11), default=5, metavar='1..10', help='修复后验证次数（默认 5）')
+    parser.add_argument('--interval', type=positive, default=2, help='验证重试间隔秒数（默认 2）')
+    args = parser.parse_args(argv)
+    url = urllib.parse.urlsplit(args.api_url)
+    if url.scheme not in ('http', 'https') or not url.hostname or url.query or url.fragment or url.username or url.password:
+        parser.error('--api-url 必须是无账号、查询参数或片段的 HTTP(S) 地址')
+    if not args.service or args.service.startswith('-'):
+        parser.error('--service 必须是有效服务名')
+    return args
+
+
+def main(argv=None):
     try:
-        with urllib.request.urlopen(base + '/v1/ports', timeout=TIMEOUT) as response:
-            data = json.load(response)
-        ports_after = data.get('ports') if isinstance(data, dict) else None
-        if not isinstance(ports_after, list) or any(
-            not isinstance(port, dict) or 'id' not in port or port['id'] is None
-            or isinstance(port['id'], bool) or not isinstance(port['id'], (str, int))
-            or not str(port['id']).strip() for port in ports_after
-        ):
-            raise ValueError('返回的端口列表或端口 ID 无效，无法验证')
-        remaining = {str(port['id']) for port in ports_after}
-        for port in down:
-            port_id = str(port['id'])
-            if port_id in remaining:
-                print('验证失败：端口 {} 仍在列表中。'.format(port_id))
-                success = False
-            else:
-                print('验证成功：端口 {} 已从列表消失。'.format(port_id))
-    except (OSError, ValueError, UnicodeError) as exc:
-        print('删除后端口验证失败: {}'.format(exc))
-        success = False
-    return success
-
-
-def main():
-    service_result = check_services()
-    print('\n最后检查 IPMI 管理控制器信息。')
-    env = os.environ.copy()
-    result = run(['ipmitool', '-I', 'open', '-U', 'operator', '-E', 'mc', 'info'], env=env)
-    ipmi_ok = result is not None and result.returncode == 0
-    print('ipmitool mc info: {}'.format('正常' if ipmi_ok else '异常'))
-    if service_result != 0 or not ipmi_ok:
-        print('\n最终结果：存在异常，请检查上面的输出。')
-        return 1
-    if not check_ports():
-        print('\n最终结果：端口检查或删除失败。')
-        return 1
-    print('\n最终结果：各项检查和端口处理完成。')
-    return 0
+        return Checker(parse_args(argv)).execute()
+    except KeyboardInterrupt:
+        print('\n检查被中断；已执行的修复不会自动回滚。', file=sys.stderr)
+        return 130
 
 
 if __name__ == '__main__':
